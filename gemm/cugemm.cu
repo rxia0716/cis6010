@@ -344,7 +344,21 @@ __global__ void runGmemCoalesced(int M, int N, int K, float alpha, float *A, flo
 {
     // HW1 TODO: copy runBasic() code here and update to avoid uncoalesced accesses to global memory.
     // Note, you are also free to change the grid dimensions in the kernel launch below.
+    const unsigned x = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned y = blockIdx.y * blockDim.y + threadIdx.y;
 
+    if (x < M && y < N)
+    {
+        float tmp = 0.0;
+        // C = α*(AxB)+β*C
+        for (int i = 0; i < K; ++i)
+        {
+            // tmp += __A__[x][i] * __B__[i][y]
+            tmp += A[(x * K) + i] * B[(y * K) + i];
+        }
+        // __C__[x][y]
+        C[(x * N) + y] = (alpha * tmp) + (beta * C[x * N + y]);
+    }
 }
 
 const uint F = 32;
@@ -358,9 +372,31 @@ __global__ void runSharedMem(int M, int N, int K, float alpha, float *A, float *
     // Note, you will also need to change the grid dimensions in the kernel launch below to take into account the value
     // of F (which is a constant, defined above). You should experiment with different values of F to see how it 
     // affects performance.
+    const unsigned x = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned y = blockIdx.y * blockDim.y + threadIdx.y;
+
+    const unsigned tx = threadIdx.x;
+    const unsigned ty = threadIdx.y;
 
     __shared__ float SA[F][F];
     __shared__ float SB[F][F];
+
+    float tmp = 0.0;
+    if (x < M && y < N){
+        for(int tile = 0; tile < (K + F - 1) / F; tile++){
+            SA[ty][tx] = A[x * K + tile * F + tx]
+            SB[ty][tx] = B[(tile * F + ty) * N + y]
+            __syncthreads();
+
+            for (j = 0; j < F; j++) {
+                tmp += SA[ty][j] * SB[j][tx];
+            }
+            
+            __syncthreads();
+        }
+    }
+     
+    C[x * N + y] = (alpha * tmp) + (beta * C[x * N + y]);
 
 }
 
@@ -378,8 +414,56 @@ __global__ void runSharedMemMultiOutput(int M, int N, int K, float alpha, float 
     __shared__ float SA[F][F];
     __shared__ float SB[F][F];
 
-    float LC[G][G] = {0.0};
+    float LC[G][G] = {0.0}; 
 
+    const unsigned x = blockIdx.x * blockDim.x * G + threadIdx.x * G; // c row
+    const unsigned y = blockIdx.y * blockDim.y * G + threadIdx.y * G; // c col
+    
+    const unsigned tx = threadIdx.x;
+    const unsigned ty = threadIdx.y;
+
+    float tmp = 0.0;
+    for(int tile = 0; tile < (K + F - 1) / F; tile++){
+        for (int i = 0; i < G; i++) {
+            for (int j = 0; j < G; j++) {
+                unsigned A_row = x + i;
+                unsigned A_col = tile * F + tx * G + j;
+
+                if (A_row < M && A_col < K) {
+                    SA[ty * G + i][tx * G + j] = A[A_row * K + A_col];
+                }
+
+                unsigned B_row = tile * F + ty * G + i;
+                unsigned B_col = y + j;
+
+                if (B_row < K && B_col < N) {
+                    SB[ty * G + i][tx * G + j] = B[B_row * N + B_col];
+                }
+            }
+        }
+        
+        __syncthreads();
+
+        for (int t = 0; t < F; t++) {
+            for (int i = 0; i < G; i++) {
+                for (int j = 0; j < G; j++) {
+                    LC[i][j] += SA[ty * G + i][t] * SB[t][tx * G + j];
+                }
+            }
+        }
+
+        __syncthreads();
+    }
+
+    for (int i = 0; i < G; i++) {
+        for (int j = 0; j < G; j++) {
+            unsigned C_row = x + i;
+            unsigned C_col = y + j;
+            if (C_row < M && C_col < N) {
+                C[C_row * N + C_col] = alpha * LC[i][j] + beta * C[C_row * N + C_col];
+            }
+        }
+    }
 }
 
 void runAlgo(Algo algo, cublasHandle_t handle, int M, int N, int K, float alpha,
